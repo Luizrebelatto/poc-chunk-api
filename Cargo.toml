@@ -1,6 +1,10 @@
 [package]
-name = "poc-chunk-api"
+name = "chunk_server"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+rocket = { version = "0.5.1", features = ["json"] }
+rocket-multipart-form-data = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rocket_dyn_templates = { version = "0.1", features = ["tera"] }
