@@ -1,0 +1,5 @@
+{
+  "main": "main.abc123.js",
+  "vendor": "vendor.def456.js",
+  "utils": "utils.ghi789.js"
+}
