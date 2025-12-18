@@ -10,10 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 
-/// Manifest que mapeia scriptId -> nome do arquivo real (com hash)
 type Manifest = HashMap<String, String>;
 
-/// Wrapper para resposta com headers de cache
 struct CachedFile(NamedFile);
 
 impl<'r> Responder<'r, 'static> for CachedFile {
@@ -27,23 +25,14 @@ impl<'r> Responder<'r, 'static> for CachedFile {
     }
 }
 
-/// Health check
-#[get("/")]
-fn index() -> &'static str {
-    "Chunk Server is up 🚀"
-}
-
-/// Endpoint para servir chunks
-/// GET /chunks/<script_id>
 #[get("/chunks/<script_id>")]
 async fn get_chunk(script_id: &str, manifest: &State<Arc<Manifest>>) -> Result<CachedFile, (rocket::http::Status, String)> {
-    // Busca o nome do arquivo no manifest
     let file_name = manifest
         .get(script_id)
         .ok_or_else(|| {
             (
                 rocket::http::Status::NotFound,
-                format!("Chunk com scriptId '{}' não foi encontrado.", script_id),
+                format!("Internal error while sending the chunk.", script_id),
             )
         })?;
 
@@ -60,23 +49,22 @@ async fn get_chunk(script_id: &str, manifest: &State<Arc<Manifest>>) -> Result<C
         })
 }
 
-/// Carrega o manifest.json
 async fn load_manifest() -> Manifest {
     match fs::read_to_string("manifest.json").await {
         Ok(content) => {
             match serde_json::from_str(&content) {
                 Ok(manifest) => {
-                    println!("Manifest carregado: {:?}", manifest);
+                    println!("Manifest loaded: {:?}", manifest);
                     manifest
                 }
                 Err(e) => {
-                    eprintln!("Erro ao parsear manifest.json: {} — fallback para vazio.", e);
+                    eprintln!("Error parsing manifest.json: {} — fallback to empty.", e);
                     HashMap::new()
                 }
             }
         }
         Err(_) => {
-            eprintln!("Nenhum manifest.json encontrado — fallback para nome direto.");
+            eprintln!("No manifest.json found — fallback to direct name.");
             HashMap::new()
         }
     }
@@ -95,7 +83,6 @@ async fn rocket() -> _ {
         .merge(("port", port))
         .merge(("address", "0.0.0.0"));
 
-    println!("Chunk Server rodando em http://localhost:{}", port);
 
     rocket::custom(figment)
         .manage(manifest)
