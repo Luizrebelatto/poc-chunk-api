@@ -1,101 +1,103 @@
-#[macro_use] extern crate rocket;
+#[macro_use]
+extern crate rocket;
 
-mod db;
-mod models;
-
-use rocket::fs::{FileServer, TempFile, NamedFile};
-use rocket::form::Form;
-use rocket::serde::json::Json;
-use rocket::{State, fairing::AdHoc};
-use sqlx::PgPool;
+use rocket::fs::NamedFile;
+use rocket::http::Header;
+use rocket::response::Responder;
+use rocket::{Request, Response, State};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use models::{Chunk, NewChunk};
-use std::env;
+use std::sync::Arc;
+use tokio::fs;
 
-#[derive(FromForm)]
-struct UploadForm<'r> {
-    file: TempFile<'r>,
-}
+/// Manifest que mapeia scriptId -> nome do arquivo real (com hash)
+type Manifest = HashMap<String, String>;
 
-#[post("/upload/<filename>", data = "<form>")]
-async fn upload_chunk(
-    filename: &str,
-    mut form: Form<UploadForm<'_>>,
-    db: &State<PgPool>
-) -> Json<String> {
-    let path = format!("data/{filename}");
+/// Wrapper para resposta com headers de cache
+struct CachedFile(NamedFile);
 
-    if let Err(e) = form.file.persist_to(&path).await {
-        return Json(format!("Error saving file: {e}"));
-    }
-
-    let metadata = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) => return Json(format!("Error reading metadata: {e}")),
-    };
-
-    let new_chunk = NewChunk {
-        filename: filename.to_string(),
-        file_path: path.clone(),
-        size: metadata.len() as i64,
-        content_type: form.file.content_type().map(|ct| ct.to_string()),
-    };
-
-    match db::insert_chunk(db, new_chunk).await {
-        Ok(chunk) => Json(format!("Chunk {} successfully saved! ID: {}", chunk.filename, chunk.id)),
-        Err(e) => Json(format!("Error saving to database: {e}")),
+impl<'r> Responder<'r, 'static> for CachedFile {
+    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
+        Response::build_from(self.0.respond_to(req)?)
+            .header(Header::new(
+                "Cache-Control",
+                "public, max-age=86400, immutable",
+            ))
+            .ok()
     }
 }
 
-#[get("/chunk/<filename>")]
-async fn get_chunk(filename: &str) -> Option<NamedFile> {
-    let path = PathBuf::from("data").join(filename);
-    NamedFile::open(path).await.ok()
+/// Health check
+#[get("/")]
+fn index() -> &'static str {
+    "Chunk Server is up 🚀"
 }
 
-#[get("/chunks")]
-async fn list_chunks(db: &State<PgPool>) -> Json<Vec<Chunk>> {
-    match db::list_all_chunks(db).await {
-        Ok(chunks) => Json(chunks),
-        Err(_) => Json(vec![]),
-    }
+/// Endpoint para servir chunks
+/// GET /chunks/<script_id>
+#[get("/chunks/<script_id>")]
+async fn get_chunk(script_id: &str, manifest: &State<Arc<Manifest>>) -> Result<CachedFile, (rocket::http::Status, String)> {
+    // Busca o nome do arquivo no manifest
+    let file_name = manifest
+        .get(script_id)
+        .ok_or_else(|| {
+            (
+                rocket::http::Status::NotFound,
+                format!("Chunk com scriptId '{}' não foi encontrado.", script_id),
+            )
+        })?;
+
+    let file_path = PathBuf::from("chunks").join(file_name);
+
+    NamedFile::open(&file_path)
+        .await
+        .map(CachedFile)
+        .map_err(|_| {
+            (
+                rocket::http::Status::InternalServerError,
+                "Erro interno ao enviar o chunk.".to_string(),
+            )
+        })
 }
 
-#[delete("/chunk/<filename>")]
-async fn delete_chunk(filename: &str, db: &State<PgPool>) -> Json<String> {
-    match db::delete_chunk(db, filename).await {
-        Ok(deleted) => {
-            if deleted {
-                let path = PathBuf::from("data").join(filename);
-                if let Err(e) = std::fs::remove_file(&path) {
-                    return Json(format!("Chunk removed from database, but error deleting file: {e}"));
+/// Carrega o manifest.json
+async fn load_manifest() -> Manifest {
+    match fs::read_to_string("manifest.json").await {
+        Ok(content) => {
+            match serde_json::from_str(&content) {
+                Ok(manifest) => {
+                    println!("Manifest carregado: {:?}", manifest);
+                    manifest
                 }
-                Json(format!("Chunk {} successfully deleted!", filename))
-            } else {
-                Json(format!("Chunk {} not found", filename))
+                Err(e) => {
+                    eprintln!("Erro ao parsear manifest.json: {} — fallback para vazio.", e);
+                    HashMap::new()
+                }
             }
         }
-        Err(e) => Json(format!("Error deleting chunk: {e}")),
+        Err(_) => {
+            eprintln!("Nenhum manifest.json encontrado — fallback para nome direto.");
+            HashMap::new()
+        }
     }
 }
 
 #[launch]
 async fn rocket() -> _ {
-    dotenv::dotenv().ok();
+    let manifest = Arc::new(load_manifest().await);
 
-    let database_url = env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set in .env file");
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
 
-    let pool = db::create_pool(&database_url)
-        .await
-        .expect("Failed to create database pool");
+    let figment = rocket::Config::figment()
+        .merge(("port", port))
+        .merge(("address", "0.0.0.0"));
 
-    rocket::build()
-        .manage(pool)
-        .mount("/", routes![upload_chunk, get_chunk, list_chunks, delete_chunk])
-        .mount("/files", FileServer::from("data"))
-        .attach(AdHoc::on_ignite("Run Migrations", |rocket| async {
-            println!("Database connected!");
-            rocket
-        }))
+    println!("Chunk Server rodando em http://localhost:{}", port);
+
+    rocket::custom(figment)
+        .manage(manifest)
+        .mount("/", routes![index, get_chunk])
 }
